@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试快照和缓存
+tests/_snapshots/
+.pytest_cache/
+.mypy_cache/
+
+# 数据文件
+*.npz
+*.pkl
+*.pt
+*.txt  # 但你可能需要保留某些文本文件
+
+# 其他
+*.log
