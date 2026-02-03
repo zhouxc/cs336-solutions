@@ -1,427 +1,382 @@
 import os
 import re
-import gc
+import ast
 import time
 import regex
-import pstats
-import logging
 import cProfile
-import datetime
-import multiprocessing as mp
-from functools import partial
-from collections import defaultdict
-
+from typing import Iterator
+from typing import Iterable
 from typing import TypeAlias
-from typing import BinaryIO
 
+from memory_profiler import profile
+
+from collections import defaultdict
 
 ByteTuple:TypeAlias = tuple[bytes, ...]
 
+class WordData:
+    def __init__(self):
+        self.word_pair_d:\
+            dict[ByteTuple:set[ByteTuple]]\
+            = defaultdict(set)
+        self.pair_word_d:\
+            dict[ByteTuple:set[ByteTuple]]\
+            = defaultdict(set)
+        self.words_idx:\
+            dict[ByteTuple:set[int]] \
+            = defaultdict(set)
 class BPETokenizer:
     def __init__(
             self, 
-            train_data_path:str='',
-            special_tokens:list[str]=[],
-            vocab_size:int=256,
-            num_processes:int=8,
-            batch_num:int=4):
-        self.train_data_path = train_data_path
-        self.train_samples:list[str] = []
-        self.train_samples_new:list[str] = []
-        
-        self.vocab_size = vocab_size
-        self.vocab:dict[bytes,int] = {}
-        self.r_vocab:dict[bytes,int] = {}
+            vocab:dict[int,bytes],
+            merges:list[ByteTuple],
+            special_tokens=list[str]|None):
+        self.vocab = vocab
+        self.merges = merges
         self.special_tokens = special_tokens
-        self.split_token = b"<|endoftext|>"
-        self.num_processes = num_processes
-        self.batch_num = batch_num
+        self.r_vocab:dict[bytes,int] = \
+                    defaultdict(dict)
+        for _id, word in self.vocab.items():
+            self.r_vocab[word] = _id
 
-        self.new_words_freq:dict[
-                bytes, 
-                int] = defaultdict(int)
-        self.words_freq:dict[
-                ByteTuple, 
-                int] = defaultdict(int)
-        self.pair_freq:dict[
-                ByteTuple,
-                int] = defaultdict(int)
-        self.pair_word_d:dict[
-                ByteTuple,
-                set(ByteTuple)] = defaultdict(set)
-        self.word_pair_d:dict[
-                ByteTuple,
-                set(ByteTuple)] = defaultdict(set)
-        self.merges:list[ByteTuple] = []
-        self.setup_logging()
+    @classmethod
+    def from_files(
+            cls,
+            vocab_filepath:str,
+            merges_filepath:str,
+            special_tokens:list[str]|None=None):
+        if special_tokens is None:
+            special_tokens = []
+        vocab = cls._read_vocab_file(vocab_filepath)
+        merges = cls._read_merges_file(merges_filepath)
+        return cls(vocab, merges, special_tokens)
+
+    @staticmethod
+    def _read_vocab_file(
+            filepath:str)->dict[int,bytes]:
+        vocab:dict[int,bytes] = {}
+        with open(filepath,'r',encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split(' ',1)
+                if len(parts) != 2:
+                    continue
+                _id = int(parts[0].strip())
+                token_str = parts[1].strip()
+                token = ast.literal_eval(token_str)
+                vocab[_id] = token
+        return vocab
     
-    def setup_logging(self):
-        self.logger = \
-                logging.getLogger('BPEProcess')
-        self.logger.setLevel(logging.INFO)
-        if self.logger.handlers:
-            return
-        formatter = logging.Formatter(
-                '%(asctime)s '
-                '%(levelname)s:'
-                '%(message)s',
-                datefmt='%H:%M:%S'
-        )
-        file_handler = logging.FileHandler(\
-                './log/bpe_train.log', 
-                encoding='utf-8')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
-        self.logger.info("setup_logging: log init sucess")
-
-    def add_special_tokens(self):
-        for token in self.special_tokens:
-            e_token = token.encode('utf-8')
-            if e_token not in self.vocab:
-                self.vocab[e_token] = len(self.vocab)
+    @staticmethod
+    def _parse_merge_pair(
+            line:str)->ByteTuple|None:
+        # format (b'left', b'right')
+        if not (line.startswith('(') and \
+                line.endswith(')')):
+            return None
+        pair = ast.literal_eval(line)
+        if not (isinstance(pair, tuple) and \
+                len(pair) == 2):
+            return None
+        left, right = pair
+        if isinstance(left, bytes):
+            left_bytes = left
+            right_bytes = right
+        else:
+            left_bytes = str(left).encode()
+            right_byges = str(right).encode()
+        return (left_bytes, right_bytes)
     
-    def init_vocab(self):
-        self.vocab= {bytes([x]):x \
-                        for x in range(256)}
-        self.add_special_tokens()
-
-    def split_by_special_tokens(
-            self,
+    @staticmethod
+    def _read_merges_file(
+            filepath:str)->list[ByteTuple]:
+        merges:list[ByteTuple] = []
+        with open(filepath,'r',encoding='utf-8') as f:
+            for line in f:
+                pair = BPETokenizer._parse_merge_pair(
+                        line.strip())
+                if pair is not None:
+                    merges += [pair]
+        return merges
+    
+    @staticmethod
+    def _calc_gpt2_words(
             text:str,
             special_tokens:list[str]
-        ) -> list[str]:
-        if not special_tokens:
-            return [text]
-        escaped_tokens = [ re.escape(token) 
-              for token in special_tokens
-            ]
-        pattern = '|'.join(escaped_tokens)
-        splits = re.split(pattern, text)
-        result = [x for x in splits if x.strip()]
-        return result
-    
-    def find_chunk_boundaries(
-            self,
-            chunk_num:int,
-            split_token:bytes,
-            file:BinaryIO)->list[int]:
-        file.seek(0, os.SEEK_END)
-        file_size = file.tell()
-        file.seek(0)
-        chunk_size = file_size // chunk_num
-        boundaries = [\
-                x * chunk_size \
-                for x in range(chunk_num+1)
-            ]
-        boundaries[-1] = file_size
-        
-        min_chunk_size = 4096
-        for x in range(1, len(boundaries)):
-            cur_pos = boundaries[x]
-            file.seek(cur_pos)
-            while True:
-                min_chunk = file.read(min_chunk_size)
-                if min_chunk == b"":
-                    boundaries[x] = file_size
-                    break
-                sptoken_pos = min_chunk.find(split_token)
-                if sptoken_pos != -1:
-                    boundaries[x] = cur_pos + sptoken_pos
-                    break
-                cur_pos += min_chunk_size
-        
-        boundaries=sorted(set(boundaries))
-        return list(zip(
-            boundaries[:-1], boundaries[1:]))
-    
-    def calc_gpt2_words(
-            self, 
-            train_text:str
-            )->dict[ByteTuple,int]:
+            )->list[ByteTuple]:
+
         pattern = (
-            r"'(?:[sdmt]|ll|ve|re)" +
-            r"| ?\p{L}+" +
-            r"| ?\p{N}+" +
-            r"| ?[^\s\p{L}\p{N}]+" +
-            r"|\s+(?!\S)" +
-            r"|\s+"
+                r"'(?:[sdmt]|ll|ve|re)" +
+                r"| ?\p{L}+" +
+                r"| ?\p{N}+" +
+                r"| ?[^\s\p{L}\p{N}]+" +
+                r"|\s+(?!\S)" +
+                r"|\s+"
         )
-
-        train_samples = []
-        splits = self.split_by_special_tokens(
-                        train_text,
-                        self.special_tokens
-                    )
-        train_samples.extend(splits)
-        
-        words_freq:dict[ByteTuple:int] \
-                = defaultdict(int)
-
-        for sample in train_samples:
+        words:ByteTuple = []
+        _words:dict = {}
+        splits = BPETokenizer._split_by_tokens(
+                text,
+                special_tokens)
+        for split in splits:
+            if special_tokens is not None and\
+                    split in special_tokens:
+                words += [(split.encode('utf-8'),)]
+                continue
+            #print(split)
+            #print("---------")
             gpt2_words = regex.findall(
-                    pattern, 
-                    sample, 
+                    pattern,
+                    split,
                     regex.UNICODE)
+            #print(gpt2_words)
             for word in gpt2_words:
-                word = tuple(bytes([x])\
+                word_byte = tuple(bytes([x])\
                     for x in word.encode('utf-8'))
-                words_freq[word] += 1
-        
-        return words_freq
-
-    def mp_pre_tokenizer(self): 
-        self.logger.info("mp_pre_tokenizer: "
-                    "mp_pre_tokenizer process start")
-        with open(self.train_data_path, "rb") as file:
-            batch_num = self.batch_num
-            v_proc_num = 2 * self.num_processes
-            chunk_num = batch_num * v_proc_num
-            chunk_boundaries = \
-                    self.find_chunk_boundaries(
-                    chunk_num,
-                    self.split_token,
-                    file
-                    )
-            self.logger.info("mp_pre_tokenizer: "
-                    f"batch_vproc_chunk_bd_num:"
-                    f"[{batch_num}|"
-                    f"{v_proc_num}|"
-                    f"{chunk_num}|"
-                    f"{len(chunk_boundaries)}]")
-
-            self.logger.info("mp_pre_tokenizer: "
-                    "read data and process begin")
-            start_time=time.time()
-            for idx in range(0, chunk_num, v_proc_num):
-                batch_boundaries = \
-                    chunk_boundaries[idx:idx+v_proc_num] 
-                self.logger.info("mp_pre_tokenizer: "
-                    f"read data batch-{idx//v_proc_num}")
-                def read_chunks_generator():
-                    for start , end in batch_boundaries:
-                        file.seek(start)
-                        chunk_size = end - start
-                        chunk_text = \
-                            file.read(chunk_size\
-                            ).decode('utf-8')
-                        yield chunk_text
-                self.logger.info("mp_pre_tokenizer: "
-                    f"process batch-{idx//v_proc_num} begin")
-                with mp.Pool(processes = \
-                    self.num_processes) as pool:
-                    for result in pool.imap_unordered(
-                            self.calc_gpt2_words, 
-                            read_chunks_generator()):
-                        for word,freq in result.items():
-                            self.words_freq[word] += freq
-                        del result
-                self.logger.info("mp_pre_tokenizer: "
-                    f"process batch-{idx//v_proc_num} complete")
-            end_time=time.time()
-            self.logger.info("mp_pre_tokenizer: "
-                f"pre-tokenizer complete ["
-                f"ct:{(end_time-start_time):.3f}s]")
+                _words[word_byte]=0
+                #words += [word_byte]
+        return words
     
-    def find_max(
-                self,
-                target_words:set[ByteTuple],
-                pre_m_bytes:bytes
-        )->ByteTuple:
-        for word in target_words:
-            for x in range(len(word) - 1):
-                if pre_m_bytes !=b'' \
-                    and word[x] != pre_m_bytes \
-                    and word[x+1] != pre_m_bytes:
-                    continue
-                byte_pair = (word[x], word[x+1])
-                self.pair_freq[byte_pair] += \
-                        self.words_freq[word]
-                self.pair_word_d[byte_pair].add(word)
-                self.word_pair_d[word].add(byte_pair)
-        
-        max_freq = -1
-        max_freq_pair = None
-        for pair, freq in self.pair_freq.items():
-            if freq > max_freq or \
-                (freq == max_freq and \
-                    pair > max_freq_pair):
-                max_freq, max_freq_pair = freq, pair
-        
-        return max_freq_pair
-    
-    def calc_new_word(
-            self,
-            freq:int,
+    @staticmethod
+    def _split_by_tokens(
+            text:str,
+            tokens:list[str])->list[str]:
+        if not tokens:
+            return [text]
+        tokens = sorted(
+                tokens, 
+                key=len, 
+                reverse=True)
+        escaped_tokens = [re.escape(token)
+                    for token in tokens
+        ]
+        pattern = f'({"|".join(escaped_tokens)})'
+        splits = re.split(pattern, text)
+        return splits
+
+    @staticmethod
+    def _calc_new_word(
             word:ByteTuple,
-            max_freq_pair:ByteTuple)->tuple:
+            merge:ByteTuple)->ByteTuple:
         x = 0
-        new_word = ()
+        new_word:ByteTuple = ()
         while x < len(word):
-            if x == len(word)-1:
+            if x == len(word) - 1:
                 new_word += (word[x],)
                 x += 1
-                continue
-            byte_pair = (word[x], word[x+1])
-            if byte_pair == max_freq_pair:
-                new_word += (word[x] + word[x+1],)
-                if x - 1 >= 0:
-                    l_pair = (word[x-1], word[x])
-                    self.pair_freq[l_pair] -= freq
-                if x + 2 < len(word):
-                    r_pair = (word[x+1], word[x+2])
-                    self.pair_freq[r_pair] -= freq
+                break
+            pair_bytes = word[x] + word[x+1]
+            merge_bytes = merge[0] + merge[1]
+            if pair_bytes == merge_bytes:
+                new_word += (merge_bytes,)
                 x += 2
             else:
                 new_word += (word[x],)
                 x += 1
         return new_word
+    @staticmethod
+    def _calc_word_pair(
+            word:ByteTuple)->set[ByteTuple]:
+        pairs:set[ByteTuple] = set()
+        for x in range(len(word)-1):
+            pair = (word[x], word[x+1])
+            pairs.add(pair)
+        return pairs
     
-    def update_words_dict(
-            self,
+    def _update_word_data(
             word:ByteTuple,
             new_word:ByteTuple,
-            max_freq_pair:ByteTuple):
-        freq = self.words_freq[word]
-        self.words_freq[new_word] = freq
-        self.words_freq.pop(word)
-        for pair in self.word_pair_d[word]:
-            self.pair_word_d[pair].remove(word)
-            self.pair_word_d[pair].add(new_word)
-        self.word_pair_d.pop(word)
+            word_data:WordData
+            ):
+        words_idx = word_data.words_idx
+        word_pair_d = word_data.word_pair_d
+        pair_word_d = word_data.pair_word_d
         
-        for x in range(len(new_word)-1):
-            pair = (new_word[x], new_word[x+1])
-            self.word_pair_d[new_word].add(pair)
-        
-        for x in range(len(word) - 1):
-            pair = (word[x], word[x+1])
-            found = False
-            for y in range(len(new_word) - 1):
-                new_pair = (new_word[y], 
-                            new_word[y+1])
-                if pair == new_pair:
-                    found = True
-                    break
-            if found == True:
-                continue
-            if new_word in self.pair_word_d[pair]:
-                self.pair_word_d[pair].remove(new_word)
+        words_idx[new_word] = words_idx[word]
+        words_idx.pop(word)
+        for pair in word_pair_d[word]:
+            pair_word_d[pair].remove(word)
+            #pair_word_d[pair].add(new_word)
+        word_pair_d.pop(word)
+        new_pairs = \
+            BPETokenizer._calc_word_pair(new_word)
+        word_pair_d[new_word] = new_pairs
+        for pair in new_pairs:
+            pair_word_d[pair].add(new_word)
 
-    def update(
+    def merge(
             self, 
-            max_freq_pair:ByteTuple
-            )->set[ByteTuple]:
-        target_words = \
-            self.pair_word_d[max_freq_pair].copy()
-        new_t_words = target_words.copy()
-        for word in target_words:
-            freq = self.words_freq[word]
-            new_word = self.calc_new_word(
-                    freq, 
+            merge:ByteTuple,
+            word_data:WordData):
+        _pair_word = word_data.pair_word_d[merge].copy()
+        for word in _pair_word:
+            new_word = BPETokenizer._calc_new_word(
                     word, 
-                    max_freq_pair)
-            if new_word == word:
+                    merge)
+            if word == new_word:
                 continue
-            new_t_words.remove(word)
-            new_t_words.add(new_word)
-            self.update_words_dict(
-                    word, 
-                    new_word, 
-                    max_freq_pair)
-        self.pair_freq.pop(max_freq_pair)
-
-        return new_t_words
-
-    def merge(self):
-        merge_bytes = b''
-        target_words = self.words_freq.keys()
-        self.logger.info('merge: bpe merge process start')
-        start_time = time.time()
-        while len(self.vocab) < self.vocab_size:
-            max_freq_pair = \
-                self.find_max(
-                        target_words,
-                        merge_bytes)
-            if len(max_freq_pair) < 2:
-                break
-            self.merges.append(max_freq_pair)
-            merge_bytes = \
-                    max_freq_pair[0] +\
-                    max_freq_pair[1]
-            if merge_bytes not in self.vocab:
-                self.vocab[merge_bytes] = len(self.vocab)
-                target_words = self.update(max_freq_pair)
-            if len(self.vocab) % 1000 == 0:
-                self.logger.info("merge: "
-                    f"merge_step:[{len(self.vocab)}:"
-                    f"{merge_bytes}]")
-        self.r_vocab = \
-                {y:x for (x,y) in self.vocab.items()}
-        end_time = time.time()
-        self.logger.info("merge: "
-                f"merge process complete ["
-                f"ct:{(end_time-start_time):.3f}s]")
-        self.logger.info("merge: "
-                f"final_vocab_size:{len(self.vocab)}")
-
-    def run(self):
-        self.init_vocab()
-        self.mp_pre_tokenizer()
-        self.merge()
-
-    def validate(self):
-        pass
-
-def train_bpe(
-        input_path:str,
-        vocab_size:int,
-        special_tokens:list[str],
-        **kwargs
-        )->tuple[dict[int, bytes],
-                 list[tuple[bytes, bytes]]]:
+            BPETokenizer._update_word_data(
+                    word, new_word, word_data) 
     
-    bpe_tokenizer = BPETokenizer(
-        input_path,
-        special_tokens,
-        vocab_size)
-    start_time = time.time()
-    bpe_tokenizer.run()
-    end_time = time.time()
-    bpe_tokenizer.logger.info(
-        f"train bpe complete ["
-        f"ct:{(end_time-start_time):.3f}s]")
+    @staticmethod
+    def _init_word_data(
+            words:list[ByteTuple],
+            word_data:WordData
+            ):
+        words_idx = word_data.words_idx
+        word_pair_d = word_data.word_pair_d
+        pair_word_d = word_data.pair_word_d
+        for x , word in enumerate(words):
+            words_idx[word].add(x)
+            if word in word_pair_d:
+                continue
+            pairs = \
+                BPETokenizer._calc_word_pair(word)
+            word_pair_d[word] = pairs
+            for pair in pairs:
+                pair_word_d[pair].add(word)
 
-    return (bpe_tokenizer.r_vocab,
-                bpe_tokenizer.merges)
+    def apply_merges(
+            self,
+            words:list[ByteTuple]
+            )->list[ByteTuple]:
+        
+        word_data = WordData()
+        new_words = list(words)
+        BPETokenizer._init_word_data(
+                words,
+                word_data
+                )
+        cunt = 1
+        for merge in self.merges: 
+            self.merge(merge, word_data)
+            cunt+=1
+            print("merge round compliete",cunt)
+        for word, ids in \
+                word_data.words_idx.items():
+            for _id in ids:
+                new_words[_id] = word
+        return new_words
 
+    def vocab_lookup(self, word:bytes)->int:
+        if word in self.r_vocab:
+            return self.r_vocab[word]
+        raise ValueError(
+            f"token {word} not in vocabulary.")
+        return -1
+
+    def encode(self, text:str)->list[int]:
+        profiler = cProfile.Profile()
+        profiler.enable()
+        
+        words = BPETokenizer._calc_gpt2_words(
+                text, self.special_tokens)
+        new_words = self.apply_merges(words)
+        ids = []
+        for word in new_words:
+            for m_byte in word:
+                _id = self.vocab_lookup(m_byte)
+                ids += [_id]
+        
+        profiler.disable()
+        profiler.print_stats(sort='cumtime')
+
+        return ids
+    
+    @profile
+    def encode_iterable(
+            self, 
+            iterable:Iterable[str]
+            )->Iterator[int]:
+        for text in iterable:
+            ids = self.encode(text)
+            for _id in ids:
+                yield _id
+
+    def decode(self, ids:list[int])->str:
+        tokens = [self.vocab[_id] for _id in ids]
+        text = b"".join(tokens).decode(
+                    "utf-8",errors="replace")
+        return text
+
+    def mp_encode(self):
+        with open(self.input_file, "rb") as file:
+            batch_num = self.batch_num
+            v_proc_num = 2 * self.num_processes
+            chunk_num = batch_num * v_proc_num
+            chunk_boundaries = \
+                    self.find_chunk_boundaries(
+                        chunk_num,
+                        self.split_token,
+                        file
+                    )
+            for idx in range(0, chunk_num, v_proc_num):
+                batch_boundaries = \
+                        chunk_boundaries[idx:idx+v_proc_num]
+                def read_chunks_generator():
+                    for start , end in batch_boundaries:
+                        file.seek(start)
+                        chunk_size = end - start
+                        chunk_text = \
+                                file.read(chunk_size\
+                                ).decode('utf-8')
+                        yield chunk_text
+                with mp.Pool(processes = \
+                        self.num_processes) as pool:
+                    for result in pool.imap_unordered(
+                            self.calc_gpt2_words,
+                            read_chunks_generator()):
 
 def output(
-        output_file:str,
-        vocab:dict[int, bytes],
-        vocab_size:int,
-        merges:list[tuple[bytes,bytes]]
+        encode_file:str,
+        decode_file:str,
+        encode_ids:list[int],
+        decode_text:str
         ):
-    with open(output_file, 'w') as f:
-        for idx,token in vocab.items():
-            print(idx, token, file = f)
+    with open(encode_file, 'w') as f:
+        print(encode_ids, file = f)
+    with open(decode_file, 'w') as f:
+        print(decode_text, file = f)
 
-if __name__ == "__main__":  
 
-    input_path = './data/owt_train.txt'
-    output_file = './output/owt_vocab.out'
-    #input_path = "./data/TinyStoriesV2-GPT4-train.txt"
-    #input_path = "./tests/fixtures/corpus.en"
-    #vocab_size = 10000
-    #vocab_size=512
-    vocab_size = 32000
+if __name__ == '__main__':
+    vocab_file = './output/ts.vocab'
+    merges_file = './output/ts.merges'
     special_tokens =["<|endoftext|>"]
-    vocab, merges = train_bpe(
-            input_path=input_path,
-            vocab_size=vocab_size,
-            special_tokens=special_tokens
-        )
-    output(
-        output_file = output_file,
-        vocab = vocab,
-        vocab_size=vocab_size,
-        merges=merges)
+    #special_tokens=["<|endoftext|>", "<|endoftext|><|endoftext|>"]
+    tokenizer = BPETokenizer.from_files(
+            vocab_file,
+            merges_file,
+            special_tokens)
+    input_file = "./data/TinyStoriesV2-GPT4-train.txt"
+    #input_file ="./tests/fixtures/tinystories_sample.txt"
+    #input_file ="./tests/fixtures/tinystories_sample_5M.txt"
+    encode_file = './output/ts.e'
+    decode_file = './output/ts.d'
+    t1=time.time()
+    with open(input_file,'r',encoding='utf-8') as f:
+        sample_text = f.read()
+    print("read_data complet",time.time()-t1)
+    #with open("./tests/fixtures/tinystories_sample_5M.txt") as f:
+    #    ids = []
+    #    print(f)
+   #     for _id in tokenizer.encode_iterable(f):
+            #print(_id,tokenizer.decode([_id]))
+    #        ids.append(_id)
+    #print(tokenizer.decode(ids) == sample_text)
+    
+    #sample_text = "Hello, how are you?"
+    #sample_text = ""
+    encoded_ids = tokenizer.encode(sample_text)
+    decoded_text = tokenizer.decode(encoded_ids)
+    output(encode_file,decode_file,encoded_ids,decoded_text)
+    #tokenized_string = [tokenizer.decode([x]) for x in encoded_ids]
+    #print(tokenized_string)
+    #print(sample_text == decoded_text)
+    #output(encode_file, decode_file, encoded_ids, decoded_text)
+    #print(decoded_text)
+    #print(sample_text)
+    #print(f"Encoded Ids: {encoded_ids}")
+    #print(f"Decoded Text: {decoded_text}")
+    t2=time.time()
+    #print(encoded_ids)
+    print(t2-t1)
