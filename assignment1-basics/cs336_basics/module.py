@@ -454,6 +454,7 @@ class MHSAttention(nn.Module):
         """
         Args:
             x:[...,seq_len,d_in] tensor
+            token_positions:[...,seq_len] tensor
         Returns:
             output:[...,seq_len,d_out] tensor
         """
@@ -474,5 +475,164 @@ class MHSAttention(nn.Module):
         output = self.o.forward(mhsa)
         return output
 
+class TransformerBlock(nn.Module):
+    def __init__(
+            self,
+            d_model:int,
+            num_heads:int,
+            d_ff:int,
+            theta:float|None=None,
+            max_seq_len:int|None=None,
+            device:torch.device|None=None
+            ):
+        super().__init__()
+        self.device = device
+        self.max_seq_len = max_seq_len
+        self.rms_norm1 = RMSNorm(
+                d_model=d_model,
+                device=device
+            )
+        self.mhsa = MHSAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                theta=theta,
+                max_seq_len=max_seq_len,
+                device=device
+            )
+        self.rms_norm2 = RMSNorm(
+                d_model=d_model,
+                device=device
+            )
+        self.ffn = SwiGLU(
+                d_model=d_model,
+                d_ff=d_ff
+            )
+    
+    def load_state_dict(
+            self,
+            state_dict:dict[str,Tensor],
+            strict=True):
 
+        self.mhsa.load_state_dict(
+            q_w=state_dict['attn.q_proj.weight'],
+            k_w=state_dict['attn.k_proj.weight'],
+            v_w=state_dict['attn.v_proj.weight'],
+            o_w=state_dict['attn.output_proj.weight'])
+        self.ffn.load_state_dict(
+            w1=state_dict['ffn.w1.weight'],
+            w2=state_dict['ffn.w2.weight'],
+            w3=state_dict['ffn.w3.weight'])
+        self.rms_norm1.load_state_dict(
+            {'w':state_dict['ln1.weight']})
+        self.rms_norm2.load_state_dict(
+            {'w':state_dict['ln2.weight']})
+    def forward(
+            self,
+            x:Tensor,
+            token_positions:Tensor|None=None
+            )->Tensor:
+        """
+            x [batch,sequence_length,d_model]
+            token_positions [batch,seq_len] or None
+        """
+        assert x.shape[-2] <= self.max_seq_len, \
+            f"TransformerBlock:seq_len {x.shape[-2]}"\
+            f"> max_seq_len {self.max_seq_len}"
+
+        if token_positions is None:
+            token_positions = torch.arange(
+                x.shape[-2], 
+                device=self.device,
+                dtype=torch.int64
+            ).unsqueeze(0).expand(x.shape[0], -1)
+
+        norm_x = self.rms_norm1.forward(x)
+        attn_out = self.mhsa.forward(
+                norm_x, token_positions)
+        x = x + attn_out
+        norm_x = self.rms_norm2.forward(x)
+        ffn_out = self.ffn.forward(norm_x)
+        x = x + ffn_out
+        return x
+
+class TransformerLM(nn.Module):
+    def __init__(
+            self,
+            vocab_size:int,
+            context_len:int,
+            num_layers:int,
+            d_model:int,
+            num_heads:int,
+            d_ff:int,
+            rope_theta:float|None=None,
+            device:torch.device|None=None
+        ):
+        super().__init__()
+        self.embedding = Embedding(
+                num_embeddings=vocab_size,
+                embedding_dim=d_model,
+                device=device
+            )
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                theta=rope_theta,
+                max_seq_len=context_len,
+                device=device
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm(
+                d_model=d_model,
+                device=device
+            )
+        self.lm_head = Linear(
+                din=d_model,
+                dout=vocab_size,
+                device=device
+            )
+
+    def load_state_dict(
+            self,
+            state_dict:dict[str,Tensor],
+            strict=True):
+        self.embedding.load_state_dict(
+           {'w':state_dict[\
+                   'token_embeddings.weight']})
+        for i, tfm_block in enumerate(
+                self.transformer_blocks):
+            prefix = f'layers.{i}.'
+            block_state_dict = {
+                k[len(prefix):]:v \
+                for k,v in state_dict.items()
+                if k.startswith(prefix)
+            }
+            tfm_block.load_state_dict(
+                block_state_dict, strict=strict)
+        self.norm.load_state_dict(
+            {'w':state_dict['ln_final.weight']})
+        self.lm_head.load_state_dict(
+            {'w':state_dict['lm_head.weight']})
+
+    def forward(
+            self,
+            x:Tensor
+            )->Tensor:
+        """
+        Args:
+            x:int[batch,seq_len]
+        Returns:
+            output:float[batch,seq_len,vocab_size]
+        """
+        # input embedding
+        x = self.embedding.forward(x)
+        #[batch, seq_len, d_model]
+        for tfm_block in self.transformer_blocks:
+            x = tfm_block.forward(x)
+        x = self.norm.forward(x)
+        logits = self.lm_head.forward(x)
+        # [batch, seq_len, vocab_size]
+        return logits
 
