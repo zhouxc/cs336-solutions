@@ -3,56 +3,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Bool, Float, Int
-
-def softmax(
-        x:torch.Tensor,
-        dim:int
-        )->torch.Tensor:
-    """
-    Args:
-        x:[...,dim] tensor
-        dim: applied in softmax
-     Returns:
-        output:[...,dim] tensor
-    """
-    max_v = torch.amax(
-            x, dim=dim, keepdim=True)
-    shift_x = x - max_v
-    exp_x = torch.exp(shift_x)
-    exp_sum = torch.sum(
-            exp_x, dim=dim, keepdim=True)
-    return exp_x/exp_sum
-
-def scaled_dot_product_attention(
-        q:torch.Tensor,
-        k:torch.Tensor,
-        v:torch.Tensor,
-        mask:torch.Tensor
-        )->torch.Tensor:
-    """
-    Args:
-        q:[..., n, d_k] query
-        k:[..., m, d_k] key
-        v:[..., m, d_v] value
-        mask:[..., n, m] bool mask
-     Returns:
-        output:[..., n, d_v] attention
-    """
-    d_k = q.shape[-1]
-    scores = torch.einsum(
-        '...nk,...mk->...nm', q, k)\
-        / math.sqrt(d_k)
-    mask_value = torch.where(
-            mask, 0, -float('inf'))
-    scores = scores + mask_value
-    attn_weights = softmax(
-                    x=scores, 
-                    dim=-1) 
-    result = torch.einsum(
-        '...nm,...mv->...nv',
-        attn_weights, v)
-    return result
-
+from utils.nn_utils import *
 
 class Linear(nn.Module):
     def __init__(
